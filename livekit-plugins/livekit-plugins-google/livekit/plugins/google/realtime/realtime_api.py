@@ -856,6 +856,7 @@ class RealtimeSession(llm.RealtimeSession):
         fut = asyncio.Future[llm.GenerationCreatedEvent]()
         self._pending_generation_fut = fut
 
+        ended_user_activity = False
         if self._in_user_activity:
             self._send_client_event(
                 types.LiveClientRealtimeInput(
@@ -863,13 +864,17 @@ class RealtimeSession(llm.RealtimeSession):
                 )
             )
             self._in_user_activity = False
+            ended_user_activity = True
 
         turns = []
         if is_given(instructions):
             turns.append(types.Content(parts=[types.Part(text=instructions)], role="model"))
-        if _needs_reply_placeholder(self._opts.model):
+        if _needs_reply_placeholder(self._opts.model) and not ended_user_activity:
+            # a closed user activity is the turn itself: a placeholder user turn after it
+            # would replace the spoken audio as what the model answers
             turns.append(types.Content(parts=[types.Part(text=".")], role="user"))
-        self._send_client_event(types.LiveClientContent(turns=turns, turn_complete=True))
+        if turns or not ended_user_activity:
+            self._send_client_event(types.LiveClientContent(turns=turns, turn_complete=True))
 
         def _on_timeout() -> None:
             if not fut.done():
