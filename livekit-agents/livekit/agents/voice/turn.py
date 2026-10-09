@@ -353,6 +353,9 @@ class BackchannelOpportunity:
     """The language the turn detector saw, when known."""
     user_emotion: UserEmotion | None = None
     """The latest estimate from ``Agent.emotion_node``, when one runs."""
+    transcript: str = ""
+    """What the user has said since the agent's last reply, as transcribed so far
+    (final segments plus the current interim one); empty without a transcriber."""
     created_at: float = field(default_factory=time.time)
 
 

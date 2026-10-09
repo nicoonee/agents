@@ -388,6 +388,9 @@ class AgentActivity(RecognitionHooks):
         # since the agent's last reply ended; a backchannel does not reset them
         self._user_turn_speech_duration: float = 0.0
         self._backchannel_count_in_turn: int = 0
+        # the user's words since the agent's last reply: final segments + the current interim one
+        self._user_turn_transcript_final: str = ""
+        self._user_turn_transcript_interim: str = ""
 
         # the user's voice as Agent.emotion_node hears it, see _start_emotion_node
         self._user_emotion: UserEmotion | None = None
@@ -1779,6 +1782,22 @@ class AgentActivity(RecognitionHooks):
             ),
         )
 
+    def _note_user_transcript(self, text: str, *, is_final: bool) -> None:
+        """Keep the user's words since the agent's last reply for the backchannel node."""
+        if is_final:
+            if text:
+                self._user_turn_transcript_final = (
+                    f"{self._user_turn_transcript_final} {text}".strip()
+                )
+            self._user_turn_transcript_interim = ""
+        else:
+            self._user_turn_transcript_interim = text
+
+    @property
+    def user_turn_transcript(self) -> str:
+        """What the user has said since the agent's last reply, as transcribed so far."""
+        return f"{self._user_turn_transcript_final} {self._user_turn_transcript_interim}".strip()
+
     @property
     def user_emotion(self) -> UserEmotion | None:
         """The latest estimate from ``Agent.emotion_node``, ``None`` without one."""
@@ -2308,6 +2327,8 @@ class AgentActivity(RecognitionHooks):
             # a reply ended: the user's next speech starts a fresh turn
             self._user_turn_speech_duration = 0.0
             self._backchannel_count_in_turn = 0
+            self._user_turn_transcript_final = ""
+            self._user_turn_transcript_interim = ""
 
     def _on_input_speech_started(self, _: llm.InputSpeechStartedEvent) -> None:
         if self.vad is None or self.using_default_vad:
@@ -2349,6 +2370,7 @@ class AgentActivity(RecognitionHooks):
             )
 
     def _on_input_audio_transcription_completed(self, ev: llm.InputTranscriptionCompleted) -> None:
+        self._note_user_transcript(ev.transcript, is_final=ev.is_final)
         self._session._user_input_transcribed(
             UserInputTranscribedEvent(
                 transcript=ev.transcript,
@@ -2609,6 +2631,8 @@ class AgentActivity(RecognitionHooks):
         self._interrupt_by_audio_activity()
 
     def on_interim_transcript(self, ev: stt.SpeechEvent, *, speaking: bool | None) -> None:
+        if ev.alternatives:
+            self._note_user_transcript(ev.alternatives[0].text, is_final=False)
         if isinstance(self.llm, llm.RealtimeModel) and self.llm.capabilities.user_transcription:
             # skip stt transcription if user_transcription is enabled on the realtime model
             return
@@ -2643,6 +2667,8 @@ class AgentActivity(RecognitionHooks):
                 self._start_false_interruption_timer(timeout)
 
     def on_final_transcript(self, ev: stt.SpeechEvent, *, speaking: bool | None = None) -> None:
+        if ev.alternatives:
+            self._note_user_transcript(ev.alternatives[0].text, is_final=True)
         if isinstance(self.llm, llm.RealtimeModel) and self.llm.capabilities.user_transcription:
             # skip stt transcription if user_transcription is enabled on the realtime model
             return
@@ -2786,6 +2812,7 @@ class AgentActivity(RecognitionHooks):
             backchannel_probability=backchannel_probability,
             language=language,
             user_emotion=self._user_emotion,
+            transcript=self.user_turn_transcript,
             created_at=now,
         )
         self._backchannel_atask = asyncio.create_task(
