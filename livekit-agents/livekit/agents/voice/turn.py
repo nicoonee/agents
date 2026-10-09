@@ -294,6 +294,12 @@ class BackchannelOptions(TypedDict, total=False):
     max_end_of_turn_probability: float
     """A turn-detector opportunity whose end-of-turn probability is above this
     value is skipped: a reply is imminent and would collide. Defaults to ``0.5``."""
+    pause_window: float
+    """Seconds after the VAD end of speech during which the pause is offered to the
+    node again every ``pause_step`` seconds while the user stays silent, with
+    ``pause_duration`` growing. ``0`` offers each pause once. Defaults to ``1.2``."""
+    pause_step: float
+    """Seconds between repeated offers of the same pause. Defaults to ``0.25``."""
 
 
 _BACKCHANNEL_DEFAULTS: BackchannelOptions = {
@@ -305,6 +311,8 @@ _BACKCHANNEL_DEFAULTS: BackchannelOptions = {
     "fire_probability": 0.8,
     "volume": 0.6,
     "max_end_of_turn_probability": 0.5,
+    "pause_window": 1.2,
+    "pause_step": 0.25,
 }
 
 
@@ -356,6 +364,11 @@ class BackchannelOpportunity:
     transcript: str = ""
     """What the user has said since the agent's last reply, as transcribed so far
     (final segments plus the current interim one); empty without a transcriber."""
+    pause_duration: float = 0.0
+    """Seconds the user has been silent at this opportunity. A VAD pause is offered
+    again while the silence lasts (see ``BackchannelOptions.pause_window``), each time
+    with the longer pause, so a node can hold a longer acknowledgement for a pause
+    that has proven long."""
     created_at: float = field(default_factory=time.time)
 
 

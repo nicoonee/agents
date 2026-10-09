@@ -391,6 +391,7 @@ class AgentActivity(RecognitionHooks):
         # the user's words since the agent's last reply: final segments + the current interim one
         self._user_turn_transcript_final: str = ""
         self._user_turn_transcript_interim: str = ""
+        self._pause_offers_atask: asyncio.Task[None] | None = None
 
         # the user's voice as Agent.emotion_node hears it, see _start_emotion_node
         self._user_emotion: UserEmotion | None = None
@@ -1675,6 +1676,7 @@ class AgentActivity(RecognitionHooks):
             if self._scheduling_atask is not None:
                 await utils.aio.cancel_and_wait(self._scheduling_atask)
 
+            self._cancel_pause_offers()
             if (emotion_ch := self._emotion_ch) is not None:
                 self._emotion_ch = None
                 emotion_ch.close()
@@ -2504,11 +2506,30 @@ class AgentActivity(RecognitionHooks):
 
     # region recognition hooks
 
+    def _cancel_pause_offers(self) -> None:
+        if self._pause_offers_atask is not None:
+            self._pause_offers_atask.cancel()
+            self._pause_offers_atask = None
+
+    async def _offer_pause_again(self, silence_so_far: float, window: float, step: float) -> None:
+        """Offer the same VAD pause to the node again while the user stays silent."""
+        elapsed = silence_so_far
+        try:
+            while elapsed < window:
+                await asyncio.sleep(step)
+                elapsed += step
+                if not self._user_silence_event.is_set():
+                    return
+                self._maybe_backchannel(source="vad", pause_duration=elapsed)
+        except asyncio.CancelledError:
+            raise
+
     def on_start_of_speech(
         self,
         ev: vad.VADEvent | None,
         speech_start_time: float,
     ) -> None:
+        self._cancel_pause_offers()
         self._session._update_user_state("speaking", last_speaking_time=speech_start_time)
         if self._audio_recognition:
             self._audio_recognition._on_start_of_speech(
@@ -2567,9 +2588,20 @@ class AgentActivity(RecognitionHooks):
         if ev is not None:
             self._user_turn_speech_duration += ev.speech_duration
             # no turn detector scores pauses in a turn the client does not own (server-side
-            # realtime detection or manual control): the VAD pause is the opportunity
+            # realtime detection or manual control): the VAD pause is the opportunity, offered
+            # again while the silence lasts so the node knows how long the pause has become
             if self._rt_turn_detection_enabled or self._turn_detection == "manual":
-                self._maybe_backchannel(source="vad")
+                silence_so_far = ev.silence_duration
+                self._maybe_backchannel(source="vad", pause_duration=silence_so_far)
+                self._cancel_pause_offers()
+                opts = self._session.options.backchannel
+                if opts["pause_window"] > 0:
+                    self._pause_offers_atask = asyncio.create_task(
+                        self._offer_pause_again(
+                            silence_so_far, opts["pause_window"], opts["pause_step"]
+                        ),
+                        name="AgentActivity.pause_offers",
+                    )
 
     def on_transcription_timeout(self, *, speech_duration: float, turn_start: float) -> None:
         self._session.emit(
@@ -2780,6 +2812,7 @@ class AgentActivity(RecognitionHooks):
         end_of_turn_probability: float | None = None,
         backchannel_probability: float | None = None,
         language: str | None = None,
+        pause_duration: float = 0.0,
     ) -> None:
         """Ask ``Agent.backchannel_node`` about this pause and play what it returns.
 
@@ -2813,6 +2846,7 @@ class AgentActivity(RecognitionHooks):
             language=language,
             user_emotion=self._user_emotion,
             transcript=self.user_turn_transcript,
+            pause_duration=pause_duration,
             created_at=now,
         )
         self._backchannel_atask = asyncio.create_task(

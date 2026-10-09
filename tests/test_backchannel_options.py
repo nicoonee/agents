@@ -35,6 +35,7 @@ def test_defaults_are_off() -> None:
     assert resolved["fire_probability"] == 0.8
     assert resolved["volume"] == 0.6
     assert resolved["max_end_of_turn_probability"] == 0.5
+    assert resolved["pause_window"] == 1.2 and resolved["pause_step"] == 0.25
 
 
 def test_partial_config_fills_the_rest_and_copies_the_clips() -> None:
