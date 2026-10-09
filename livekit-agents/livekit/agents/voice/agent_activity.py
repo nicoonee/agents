@@ -5,6 +5,7 @@ import contextlib
 import contextvars
 import heapq
 import json
+import random
 import time
 from collections.abc import AsyncGenerator, AsyncIterable, Coroutine, Iterator
 from dataclasses import dataclass
@@ -356,6 +357,12 @@ class AgentActivity(RecognitionHooks):
         self._cancel_speech_pause_task: asyncio.Task[None] | None = None
 
         self._stt_eos_received: bool = False
+
+        # agent backchannels, see _maybe_backchannel
+        self._backchannel_handle: SpeechHandle | None = None
+        self._last_backchannel_at: float = 0.0
+        # VAD speech since the agent's last reply ended; a backchannel does not reset it
+        self._user_turn_speech_duration: float = 0.0
 
         # fired when a speech_task finishes or when a new speech_handle is scheduled
         # this is used to wake up the main task when the scheduling state changes
@@ -2202,6 +2209,9 @@ class AgentActivity(RecognitionHooks):
             self._audio_recognition._on_end_of_agent_speech(ended_at=ended_at)
 
         self._interruption_detected = False
+        if self._backchannel_handle is None:
+            # a reply ended: the user's next speech starts a fresh turn
+            self._user_turn_speech_duration = 0.0
 
     def _on_input_speech_started(self, _: llm.InputSpeechStartedEvent) -> None:
         if self.vad is None or self.using_default_vad:
@@ -2399,6 +2409,7 @@ class AgentActivity(RecognitionHooks):
             self._session.agent_state != "speaking"
             and self._pause_enabled()
             and (current_speech := self._current_speech) is not None
+            and current_speech is not self._backchannel_handle
             and not current_speech.interrupted
             and current_speech.allow_interruptions
             and (self._paused_speech is None or self._paused_speech.handle is not current_speech)
@@ -2434,6 +2445,13 @@ class AgentActivity(RecognitionHooks):
 
         if self._paused_speech:
             self._start_false_interruption_timer(self._paused_speech.timeout)
+
+        if ev is not None:
+            self._user_turn_speech_duration += ev.speech_duration
+            # no turn detector scores pauses in a turn the client does not own (server-side
+            # realtime detection or manual control): the VAD pause is the opportunity
+            if self._rt_turn_detection_enabled or self._turn_detection == "manual":
+                self._maybe_backchannel(source="vad")
 
     def on_transcription_timeout(self, *, speech_duration: float, turn_start: float) -> None:
         self._session.emit(
@@ -2626,9 +2644,58 @@ class AgentActivity(RecognitionHooks):
             host._on_eot_prediction(ev)
 
     def on_agent_backchannel_opportunity(self, ev: _AgentBackchannelOpportunityEvent) -> None:
-        # TODO: consume the backchannel opportunity internally (e.g. trigger a
-        # backchannel phrase). Kept internal for now — not surfaced as a public event.
-        pass
+        # skipped when a reply is imminent: a backchannel would collide with it
+        opts = self._session.options.backchannel
+        if ev.end_of_turn_probability > opts["max_end_of_turn_probability"]:
+            return
+        self._maybe_backchannel(source="turn_detector")
+
+    def _maybe_backchannel(self, *, source: str) -> None:
+        """Play a short acknowledgement at this pause when the options allow one.
+
+        Never over the agent's own speech, never before ``min_speech`` seconds of user
+        speech since the last reply, never within ``min_interval`` of the previous one.
+        The clip is played as an interruptible ``say()`` with no chat context entry.
+        """
+        opts = self._session.options.backchannel
+        if not opts["enabled"] or not opts["audio"]:
+            return
+        if self._scheduling_paused or self._new_turns_blocked:
+            return
+        if self._session.agent_state == "speaking" or (
+            (current := self._current_speech) is not None and not current.done()
+        ):
+            return
+        if self._backchannel_handle is not None:
+            return
+        if self._user_turn_speech_duration < opts["min_speech"]:
+            return
+        now = time.time()
+        if now - self._last_backchannel_at < opts["min_interval"]:
+            return
+        if not self._session.output.audio_enabled or self._session.output.audio is None:
+            return
+
+        clip = random.choice(opts["audio"])
+        self._last_backchannel_at = now
+        logger.debug(
+            "agent backchannel",
+            extra={"source": source, "user_speech_duration": self._user_turn_speech_duration},
+        )
+        sample_rate = self._session.output.audio.sample_rate or 48000
+        handle = self.say(
+            "",
+            audio=utils.audio.audio_frames_from_file(clip, sample_rate=sample_rate),
+            allow_interruptions=True,
+            add_to_chat_ctx=False,
+        )
+        self._backchannel_handle = handle
+
+        def _done(_: SpeechHandle) -> None:
+            if self._backchannel_handle is handle:
+                self._backchannel_handle = None
+
+        handle.add_done_callback(_done)
 
     def on_end_of_turn(self, info: _EndOfTurnInfo) -> bool:
         # IMPORTANT: This method is sync to avoid it being cancelled by the AudioRecognition

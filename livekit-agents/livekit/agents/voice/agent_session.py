@@ -94,12 +94,14 @@ from .run_result import RunOutputOptions, RunResult
 from .speech_handle import InputDetails, SpeechHandle
 from .tool_executor import ToolHandlingOptions, _resolve_async_tool_options, _RunningTasks
 from .turn import (
+    BackchannelOptions,
     EndpointingOptions,
     InterruptionOptions,
     PreemptiveGenerationOptions,
     TurnDetectionMode,
     TurnHandlingOptions,
     _migrate_turn_handling,
+    _resolve_backchannel,
     _resolve_endpointing,
     _resolve_interruption,
     _resolve_preemptive_generation,
@@ -325,6 +327,10 @@ class AgentSessionOptions:
     @property
     def preemptive_generation(self) -> PreemptiveGenerationOptions:
         return self.turn_handling["preemptive_generation"]
+
+    @property
+    def backchannel(self) -> BackchannelOptions:
+        return self.turn_handling["backchannel"]
 
 
 Userdata_T = TypeVar("Userdata_T")
@@ -575,6 +581,7 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         else:
             stt_context = None
         user_turn_limit = _resolve_user_turn_limit(turn_handling.get("user_turn_limit"))
+        backchannel = _resolve_backchannel(turn_handling.get("backchannel"))
         self._aec_warmup_duration_explicit = is_given(aec_warmup_duration)
         resolved_aec_warmup_duration = (
             aec_warmup_duration if is_given(aec_warmup_duration) else _DEFAULT_AEC_WARMUP_DURATION
@@ -589,6 +596,7 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                 turn_detection=raw_turn_detection,
                 preemptive_generation=preemptive_gen,
                 user_turn_limit=user_turn_limit,
+                backchannel=backchannel,
             ),
             stt_context_options=_resolve_stt_context_options(stt_context),
             endpointing_overrides=endpointing_overrides,

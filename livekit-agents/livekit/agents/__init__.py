@@ -140,6 +140,7 @@ from .voice.run_result import (
     mock_tools,
 )
 from .voice.turn import (
+    BackchannelOptions,
     EndpointingOptions,
     InterruptionOptions,
     PreemptiveGenerationOptions,
@@ -287,6 +288,7 @@ __all__ = [
     "InterruptionOptions",
     "PreemptiveGenerationOptions",
     "UserTurnLimitOptions",
+    "BackchannelOptions",
     "KeytermsOptions",
     "KeytermDetectionOptions",
     "STTContextOptions",

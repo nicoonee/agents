@@ -257,6 +257,42 @@ _USER_TURN_LIMIT_DEFAULTS: UserTurnLimitOptions = {
 }
 
 
+class BackchannelOptions(TypedDict, total=False):
+    """Configuration for agent backchannels: short acknowledgements ("mm-hmm",
+    "right") played while the user is still speaking, without taking the turn.
+
+    Disabled by default. A backchannel plays at a pause the turn detector scores
+    as a backchannel opportunity or, when the turn is owned by a realtime model's
+    server-side detection or by manual control, at a pause reported by the
+    client-side VAD (a ``vad`` instance must be set on the session). The clip is
+    played through the session's audio output as an interruptible speech that is
+    never added to the chat context.
+    """
+
+    enabled: bool
+    """Whether the agent backchannels. Defaults to ``False``."""
+    audio: list[str]
+    """Audio files to pick from at random, one per backchannel, in any format the
+    session's codecs decode. Defaults to ``[]``, which plays nothing."""
+    min_interval: float
+    """Minimum seconds between two backchannels. Defaults to ``4.0``."""
+    min_speech: float
+    """Seconds of user speech since the agent last spoke before the first
+    backchannel. Defaults to ``2.0``."""
+    max_end_of_turn_probability: float
+    """A turn-detector opportunity whose end-of-turn probability is above this
+    value is skipped: a reply is imminent and would collide. Defaults to ``0.5``."""
+
+
+_BACKCHANNEL_DEFAULTS: BackchannelOptions = {
+    "enabled": False,
+    "audio": [],
+    "min_interval": 4.0,
+    "min_speech": 2.0,
+    "max_end_of_turn_probability": 0.5,
+}
+
+
 class TurnHandlingOptions(TypedDict, total=False):
     """Configuration for the turn handling system.
 
@@ -284,6 +320,8 @@ class TurnHandlingOptions(TypedDict, total=False):
     """Preemptive generation configuration. Use ``{"enabled": False}`` to disable."""
     user_turn_limit: UserTurnLimitOptions
     """User turn limit configuration. Use ``{"max_words": 50}`` to enable."""
+    backchannel: BackchannelOptions
+    """Agent backchannel configuration. Use ``{"enabled": True, "audio": [...]}`` to enable."""
 
 
 def _resolve_preemptive_generation(
@@ -331,6 +369,15 @@ def _resolve_user_turn_limit(
     if config is None:
         return UserTurnLimitOptions(**_USER_TURN_LIMIT_DEFAULTS)
     return UserTurnLimitOptions(**{**_USER_TURN_LIMIT_DEFAULTS, **config})
+
+
+def _resolve_backchannel(
+    config: BackchannelOptions | None = None,
+) -> BackchannelOptions:
+    """Fill in defaults for missing keys; the audio list is copied."""
+    resolved = BackchannelOptions(**{**_BACKCHANNEL_DEFAULTS, **(config or {})})
+    resolved["audio"] = list(resolved.get("audio") or [])
+    return resolved
 
 
 def _migrate_turn_handling(
