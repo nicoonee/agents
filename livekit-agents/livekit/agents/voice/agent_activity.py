@@ -2828,8 +2828,14 @@ class AgentActivity(RecognitionHooks):
             return
         if response is None:
             return
-        # the pause may have closed while the node decided
-        if self._session.agent_state == "speaking" or self._backchannel_handle is not None:
+        # the pause may have closed while the node decided: a backchannel that would wait for
+        # the next pause lands late and out of place, so it is dropped
+        if (
+            self._session.agent_state == "speaking"
+            or self._backchannel_handle is not None
+            or not self._user_silence_event.is_set()
+        ):
+            logger.debug("backchannel dropped, the pause closed while the node decided")
             return
         audio_output = self._session.output.audio if self._session.output.audio_enabled else None
         if audio_output is None:
