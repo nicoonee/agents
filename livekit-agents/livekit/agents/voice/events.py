@@ -295,6 +295,8 @@ EventTypes = Literal[
     "user_transcription_timeout",
     "conversation_item_added",
     "agent_false_interruption",
+    "agent_backchannel",
+    "user_emotion_changed",
     "overlapping_speech",
     "function_tools_executed",
     "metrics_collected",
@@ -374,6 +376,40 @@ class _AgentBackchannelOpportunityEvent(BaseModel):
     end_of_turn_probability: float
     end_of_turn_threshold: float
     language: str | None = None
+    created_at: float = Field(default_factory=time.time)
+
+
+class UserEmotionChangedEvent(BaseModel):
+    """``Agent.emotion_node`` heard a different dominant emotion in the user's voice.
+    Emitted on a change of label only; the latest estimate, confidence included, is
+    always on the next ``BackchannelOpportunity``."""
+
+    type: Literal["user_emotion_changed"] = "user_emotion_changed"
+    previous_label: str | None
+    label: str
+    confidence: float
+    scores: dict[str, float] = Field(default_factory=dict)
+    arousal: float | None = None
+    valence: float | None = None
+    window_duration: float = 0.0
+    created_at: float = Field(default_factory=time.time)
+
+
+class AgentBackchannelEvent(BaseModel):
+    """The agent backchanneled: ``Agent.backchannel_node`` returned a response at a
+    pause and its audio was scheduled. Gives a persona or a learning loop the record
+    of what was played and when, since nothing enters the chat context."""
+
+    type: Literal["agent_backchannel"] = "agent_backchannel"
+    source: Literal["vad", "turn_detector"]
+    """What found the pause."""
+    user_speech_duration: float
+    """Seconds of user speech since the agent's last reply, at the pause."""
+    count_in_turn: int
+    """Backchannels played since the agent's last reply, this one included."""
+    text: str
+    """The response's transcript text; empty when the clip has none."""
+    volume: float
     created_at: float = Field(default_factory=time.time)
 
 
@@ -589,6 +625,8 @@ AgentEvent = Annotated[
     | UserStateChangedEvent
     | AgentStateChangedEvent
     | AgentFalseInterruptionEvent
+    | AgentBackchannelEvent
+    | UserEmotionChangedEvent
     | MetricsCollectedEvent
     | SessionUsageUpdatedEvent
     | ConversationItemAddedEvent

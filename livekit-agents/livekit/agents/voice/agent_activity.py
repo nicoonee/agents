@@ -5,12 +5,12 @@ import contextlib
 import contextvars
 import heapq
 import json
-import random
 import time
 from collections.abc import AsyncGenerator, AsyncIterable, Coroutine, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
+import numpy as np
 from opentelemetry import context as otel_context, trace
 
 from livekit import rtc
@@ -62,6 +62,7 @@ from .audio_recognition import (
 )
 from .endpointing import create_endpointing
 from .events import (
+    AgentBackchannelEvent,
     AgentFalseInterruptionEvent,
     AgentState,
     AgentStateChangedEvent,
@@ -71,6 +72,7 @@ from .events import (
     MetricsCollectedEvent,
     SessionUsageUpdatedEvent,
     SpeechCreatedEvent,
+    UserEmotionChangedEvent,
     UserInputTranscribedEvent,
     UserTranscriptionTimeoutEvent,
     UserTurnExceededEvent,
@@ -101,9 +103,11 @@ from .generation import (
 from .speech_handle import DEFAULT_INPUT_DETAILS, InputDetails, InterruptionSource, SpeechHandle
 from .tool_executor import _resolve_async_tool_options, _RunningTasks, _ToolExecutor
 from .turn import (
+    BackchannelOpportunity,
     EndpointingOptions,
     PreemptiveGenerationOptions,
     TurnDetectionMode,
+    UserEmotion,
     _resolve_endpointing,
     _StreamingTurnDetector,
     _StreamingTurnDetectorStream,
@@ -328,6 +332,24 @@ def _record_queue_wait(speech_handle: SpeechHandle) -> None:
 
 
 # NOTE: AgentActivity isn't exposed to the public API
+async def _scale_volume(
+    frames: AsyncIterable[rtc.AudioFrame], volume: float
+) -> AsyncGenerator[rtc.AudioFrame, None]:
+    """Apply a gain to audio frames; passes them through unchanged at ``1.0``."""
+    async for frame in frames:
+        if volume == 1.0:
+            yield frame
+            continue
+        samples = np.frombuffer(frame.data, dtype=np.int16).astype(np.float32) * volume
+        scaled = np.clip(samples, -32768, 32767).astype(np.int16)
+        yield rtc.AudioFrame(
+            data=scaled.tobytes(),
+            sample_rate=frame.sample_rate,
+            num_channels=frame.num_channels,
+            samples_per_channel=frame.samples_per_channel,
+        )
+
+
 class AgentActivity(RecognitionHooks):
     def __init__(self, agent: Agent, sess: AgentSession) -> None:
         self._agent, self._session = agent, sess
@@ -360,9 +382,17 @@ class AgentActivity(RecognitionHooks):
 
         # agent backchannels, see _maybe_backchannel
         self._backchannel_handle: SpeechHandle | None = None
-        self._last_backchannel_at: float = 0.0
-        # VAD speech since the agent's last reply ended; a backchannel does not reset it
+        self._backchannel_atask: asyncio.Task[None] | None = None
+        self._last_backchannel_at: float | None = None
+        # the user's turn as the backchannel node sees it: VAD speech and backchannels
+        # since the agent's last reply ended; a backchannel does not reset them
         self._user_turn_speech_duration: float = 0.0
+        self._backchannel_count_in_turn: int = 0
+
+        # the user's voice as Agent.emotion_node hears it, see _start_emotion_node
+        self._user_emotion: UserEmotion | None = None
+        self._emotion_ch: utils.aio.Chan[rtc.AudioFrame] | None = None
+        self._emotion_atask: asyncio.Task[None] | None = None
 
         # fired when a speech_task finishes or when a new speech_handle is scheduled
         # this is used to wake up the main task when the scheduling state changes
@@ -1342,6 +1372,8 @@ class AgentActivity(RecognitionHooks):
             reuse_resources.stt_pipeline = None
             reuse_resources.turn_detector_stream = None
 
+        self._start_emotion_node()
+
         if isinstance(self.stt, stt.STT):
             # bind the session's keyterm detector to this activity's STT (detection uses its
             # own LLM, configured via stt_context_options, not the agent's)
@@ -1640,6 +1672,13 @@ class AgentActivity(RecognitionHooks):
             if self._scheduling_atask is not None:
                 await utils.aio.cancel_and_wait(self._scheduling_atask)
 
+            if (emotion_ch := self._emotion_ch) is not None:
+                self._emotion_ch = None
+                emotion_ch.close()
+            if self._emotion_atask is not None:
+                await utils.aio.cancel_and_wait(self._emotion_atask)
+                self._emotion_atask = None
+
             # session-scoped toolsets are closed by the session; this only closes
             # the agent's own toolsets + MCP — all of which outlive pause
             toolsets = self._mcp_tools + [
@@ -1688,6 +1727,62 @@ class AgentActivity(RecognitionHooks):
 
         if self._audio_recognition is not None:
             self._audio_recognition._push_audio(frame, stt_frame=stt_frame)
+
+        if (emotion_ch := self._emotion_ch) is not None:
+            try:
+                emotion_ch.send_nowait(stt_frame if stt_frame is not None else frame)
+            except utils.aio.ChanFull:
+                pass  # a slow node skips audio rather than falling behind
+            except utils.aio.ChanClosed:
+                self._emotion_ch = None
+
+    def _start_emotion_node(self) -> None:
+        """Run ``Agent.emotion_node`` on the user's audio for the life of this activity."""
+        # ~10 s of 10 ms frames; a node that falls further behind loses frames
+        ch = utils.aio.Chan[rtc.AudioFrame](maxsize=1000)
+
+        async def _run() -> None:
+            try:
+                result = self._agent.emotion_node(ch)
+                if asyncio.iscoroutine(result):
+                    result = await result
+                if result is None:
+                    self._emotion_ch = None
+                    ch.close()
+                    return
+                async for emotion in result:
+                    self._on_user_emotion(emotion)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("error in emotion_node")
+                self._emotion_ch = None
+
+        self._emotion_ch = ch
+        self._emotion_atask = asyncio.create_task(_run(), name="AgentActivity.emotion_node")
+
+    def _on_user_emotion(self, emotion: UserEmotion) -> None:
+        previous = self._user_emotion
+        self._user_emotion = emotion
+        if previous is not None and previous.label == emotion.label:
+            return
+        self._session.emit(
+            "user_emotion_changed",
+            UserEmotionChangedEvent(
+                previous_label=previous.label if previous is not None else None,
+                label=emotion.label,
+                confidence=emotion.confidence,
+                scores=dict(emotion.scores),
+                arousal=emotion.arousal,
+                valence=emotion.valence,
+                window_duration=emotion.window_duration,
+            ),
+        )
+
+    @property
+    def user_emotion(self) -> UserEmotion | None:
+        """The latest estimate from ``Agent.emotion_node``, ``None`` without one."""
+        return self._user_emotion
 
     def push_video(self, frame: rtc.VideoFrame) -> None:
         if not self._started:
@@ -2212,6 +2307,7 @@ class AgentActivity(RecognitionHooks):
         if self._backchannel_handle is None:
             # a reply ended: the user's next speech starts a fresh turn
             self._user_turn_speech_duration = 0.0
+            self._backchannel_count_in_turn = 0
 
     def _on_input_speech_started(self, _: llm.InputSpeechStartedEvent) -> None:
         if self.vad is None or self.using_default_vad:
@@ -2644,48 +2740,94 @@ class AgentActivity(RecognitionHooks):
             host._on_eot_prediction(ev)
 
     def on_agent_backchannel_opportunity(self, ev: _AgentBackchannelOpportunityEvent) -> None:
-        # skipped when a reply is imminent: a backchannel would collide with it
-        opts = self._session.options.backchannel
-        if ev.end_of_turn_probability > opts["max_end_of_turn_probability"]:
-            return
-        self._maybe_backchannel(source="turn_detector")
+        self._maybe_backchannel(
+            source="turn_detector",
+            end_of_turn_probability=ev.end_of_turn_probability,
+            backchannel_probability=ev.probability,
+            language=ev.language,
+        )
 
-    def _maybe_backchannel(self, *, source: str) -> None:
-        """Play a short acknowledgement at this pause when the options allow one.
+    def _maybe_backchannel(
+        self,
+        *,
+        source: Literal["vad", "turn_detector"],
+        end_of_turn_probability: float | None = None,
+        backchannel_probability: float | None = None,
+        language: str | None = None,
+    ) -> None:
+        """Ask ``Agent.backchannel_node`` about this pause and play what it returns.
 
-        Never over the agent's own speech, never before ``min_speech`` seconds of user
-        speech since the last reply, never within ``min_interval`` of the previous one.
-        The clip is played as an interruptible ``say()`` with no chat context entry.
+        Never over the agent's own speech, never while a backchannel is pending. The
+        response is played as an interruptible ``say()`` with no chat context entry, and
+        the session emits ``agent_backchannel``.
         """
-        opts = self._session.options.backchannel
-        if not opts["enabled"] or not opts["audio"]:
-            return
         if self._scheduling_paused or self._new_turns_blocked:
             return
         if self._session.agent_state == "speaking" or (
             (current := self._current_speech) is not None and not current.done()
         ):
             return
-        if self._backchannel_handle is not None:
-            return
-        if self._user_turn_speech_duration < opts["min_speech"]:
-            return
-        now = time.time()
-        if now - self._last_backchannel_at < opts["min_interval"]:
+        if self._backchannel_handle is not None or (
+            self._backchannel_atask is not None and not self._backchannel_atask.done()
+        ):
             return
         if not self._session.output.audio_enabled or self._session.output.audio is None:
             return
 
-        clip = random.choice(opts["audio"])
-        self._last_backchannel_at = now
+        now = time.time()
+        opportunity = BackchannelOpportunity(
+            source=source,
+            user_speech_duration=self._user_turn_speech_duration,
+            count_in_turn=self._backchannel_count_in_turn,
+            since_last=None
+            if self._last_backchannel_at is None
+            else now - self._last_backchannel_at,
+            end_of_turn_probability=end_of_turn_probability,
+            backchannel_probability=backchannel_probability,
+            language=language,
+            user_emotion=self._user_emotion,
+            created_at=now,
+        )
+        self._backchannel_atask = asyncio.create_task(
+            self._backchannel_task(opportunity), name="AgentActivity.backchannel"
+        )
+
+    async def _backchannel_task(self, opportunity: BackchannelOpportunity) -> None:
+        try:
+            result = self._agent.backchannel_node(opportunity)
+            response = await result if asyncio.iscoroutine(result) else result
+        except Exception:
+            logger.exception("error in backchannel_node")
+            return
+        if response is None:
+            return
+        # the pause may have closed while the node decided
+        if self._session.agent_state == "speaking" or self._backchannel_handle is not None:
+            return
+        audio_output = self._session.output.audio if self._session.output.audio_enabled else None
+        if audio_output is None:
+            return
+
+        frames = (
+            utils.audio.audio_frames_from_file(
+                response.audio, sample_rate=audio_output.sample_rate or 48000
+            )
+            if isinstance(response.audio, str)
+            else response.audio
+        )
+        self._last_backchannel_at = time.time()
+        self._backchannel_count_in_turn += 1
         logger.debug(
             "agent backchannel",
-            extra={"source": source, "user_speech_duration": self._user_turn_speech_duration},
+            extra={
+                "source": opportunity.source,
+                "user_speech_duration": opportunity.user_speech_duration,
+                "count_in_turn": self._backchannel_count_in_turn,
+            },
         )
-        sample_rate = self._session.output.audio.sample_rate or 48000
         handle = self.say(
-            "",
-            audio=utils.audio.audio_frames_from_file(clip, sample_rate=sample_rate),
+            response.text,
+            audio=_scale_volume(frames, response.volume),
             allow_interruptions=True,
             add_to_chat_ctx=False,
         )
@@ -2696,6 +2838,16 @@ class AgentActivity(RecognitionHooks):
                 self._backchannel_handle = None
 
         handle.add_done_callback(_done)
+        self._session.emit(
+            "agent_backchannel",
+            AgentBackchannelEvent(
+                source=opportunity.source,
+                user_speech_duration=opportunity.user_speech_duration,
+                count_in_turn=self._backchannel_count_in_turn,
+                text=response.text,
+                volume=response.volume,
+            ),
+        )
 
     def on_end_of_turn(self, info: _EndOfTurnInfo) -> bool:
         # IMPORTANT: This method is sync to avoid it being cancelled by the AudioRecognition

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 from collections.abc import AsyncGenerator, AsyncIterable, Coroutine, Generator
 from dataclasses import dataclass
@@ -26,7 +27,13 @@ from ..utils import is_given, misc
 from .events import UserTurnExceededEvent
 from .speech_handle import SpeechHandle
 from .tool_executor import ToolHandlingOptions
-from .turn import TurnHandlingOptions, _migrate_turn_handling
+from .turn import (
+    BackchannelOpportunity,
+    BackchannelResponse,
+    TurnHandlingOptions,
+    UserEmotion,
+    _migrate_turn_handling,
+)
 
 if TYPE_CHECKING:
     from ..inference import LLMModels, RealtimeModels, STTModels, TTSModels
@@ -493,6 +500,61 @@ class Agent:
         """A node processing the audio from the realtime LLM session before it is played out."""
         return Agent.default.realtime_audio_output_node(self, audio, model_settings)
 
+    def backchannel_node(
+        self, opportunity: BackchannelOpportunity
+    ) -> BackchannelResponse | None | Coroutine[Any, Any, BackchannelResponse | None]:
+        """Decides whether the agent backchannels at a pause in the user's speech, and with what.
+
+        Called at every opportunity: a pause the turn detector scores as one, or, when a
+        realtime model or manual control owns the turn, a pause the client-side VAD reports.
+        Return ``None`` to stay silent, or a ``BackchannelResponse`` whose audio is played
+        as an interruptible speech that never enters the chat context. The session emits
+        ``agent_backchannel`` for each one played.
+
+        By default the decision comes from ``turn_handling["backchannel"]``: rate limits,
+        a fire probability and a random clip. Override this node to drive it from a persona
+        or from what the user has been observed to like: the opportunity carries how long
+        they have been speaking, how many times the agent already acknowledged, and the
+        detector's probabilities when it ran. The pause is short, so decide quickly; a
+        coroutine is awaited, but a slow one misses the pause.
+
+        Args:
+            opportunity (BackchannelOpportunity): The pause and the turn so far.
+
+        Returns:
+            BackchannelResponse | None: What to play, or ``None`` for nothing.
+        """
+        return Agent.default.backchannel_node(self, opportunity)
+
+    def emotion_node(
+        self, audio: AsyncIterable[rtc.AudioFrame]
+    ) -> (
+        AsyncIterable[UserEmotion]
+        | Coroutine[Any, Any, AsyncIterable[UserEmotion]]
+        | Coroutine[Any, Any, None]
+        | None
+    ):
+        """A node that listens to the user's audio and reports what it hears in the voice.
+
+        Receives the same frames the STT and the realtime model receive, as they arrive,
+        and yields a ``UserEmotion`` whenever it has a new estimate. Nothing in the session
+        waits for it: the latest estimate rides on every ``BackchannelOpportunity`` and a
+        change of the dominant label is emitted as ``user_emotion_changed``, for whatever
+        the application does with it (a persona, a tone hint to the model).
+
+        Off by default: the default returns ``None`` and no audio is buffered. Override it
+        to run a speech emotion model of your choice, typically on a sliding window of a
+        few seconds with some smoothing, and run inference off the event loop. The frames
+        keep the input's sample rate; resample if the model needs another one.
+
+        Args:
+            audio (AsyncIterable[rtc.AudioFrame]): The user's audio, as received.
+
+        Yields:
+            UserEmotion: A new estimate.
+        """
+        return Agent.default.emotion_node(self, audio)
+
     def _get_activity_or_raise(self) -> AgentActivity:
         """Get the current activity context for this task (internal)"""
         if self._activity is None:
@@ -642,6 +704,36 @@ class Agent:
             """Default implementation for `Agent.transcription_node`"""
             async for delta in text:
                 yield delta
+
+        @staticmethod
+        def backchannel_node(
+            agent: Agent, opportunity: BackchannelOpportunity
+        ) -> BackchannelResponse | None:
+            """Default implementation for `Agent.backchannel_node`: the session's
+            ``turn_handling["backchannel"]`` options decide."""
+            activity = agent._get_activity_or_raise()
+            opts = activity._session.options.backchannel
+            if not opts["enabled"] or not opts["audio"]:
+                return None
+            if opportunity.user_speech_duration < opts["min_speech"]:
+                return None
+            if opportunity.count_in_turn >= opts["max_per_turn"]:
+                return None
+            if opportunity.since_last is not None and opportunity.since_last < opts["min_interval"]:
+                return None
+            if (
+                opportunity.end_of_turn_probability is not None
+                and opportunity.end_of_turn_probability > opts["max_end_of_turn_probability"]
+            ):
+                return None
+            if random.random() >= opts["fire_probability"]:
+                return None
+            return BackchannelResponse(audio=random.choice(opts["audio"]), volume=opts["volume"])
+
+        @staticmethod
+        def emotion_node(agent: Agent, audio: AsyncIterable[rtc.AudioFrame]) -> None:
+            """Default implementation for `Agent.emotion_node`: no analysis."""
+            return None
 
         @staticmethod
         async def realtime_audio_output_node(

@@ -80,6 +80,7 @@ from .types import (
 from .version import __version__
 from .voice import (
     Agent,
+    AgentBackchannelEvent,
     AgentEvent,
     AgentFalseInterruptionEvent,
     AgentSession,
@@ -106,6 +107,7 @@ from .voice import (
     ToolCallUpdated,
     ToolExecutionUpdatedEvent,
     ToolReplyUpdated,
+    UserEmotionChangedEvent,
     UserInputTranscribedEvent,
     UserStateChangedEvent,
     UserTranscriptionTimeoutEvent,
@@ -140,11 +142,14 @@ from .voice.run_result import (
     mock_tools,
 )
 from .voice.turn import (
+    BackchannelOpportunity,
     BackchannelOptions,
+    BackchannelResponse,
     EndpointingOptions,
     InterruptionOptions,
     PreemptiveGenerationOptions,
     TurnHandlingOptions,
+    UserEmotion,
     UserTurnLimitOptions,
 )
 from .worker import (
@@ -196,6 +201,8 @@ __all__ = [
     "CloseEvent",
     "ConversationItemAddedEvent",
     "AgentStateChangedEvent",
+    "AgentBackchannelEvent",
+    "UserEmotionChangedEvent",
     "AgentFalseInterruptionEvent",
     "UserInputTranscribedEvent",
     "UserStateChangedEvent",
@@ -288,7 +295,10 @@ __all__ = [
     "InterruptionOptions",
     "PreemptiveGenerationOptions",
     "UserTurnLimitOptions",
+    "BackchannelOpportunity",
     "BackchannelOptions",
+    "BackchannelResponse",
+    "UserEmotion",
     "KeytermsOptions",
     "KeytermDetectionOptions",
     "STTContextOptions",

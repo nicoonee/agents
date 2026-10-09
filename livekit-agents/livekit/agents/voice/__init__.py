@@ -10,6 +10,7 @@ from .agent_session import (
 )
 from .audio_recognition import AudioRecognition
 from .events import (
+    AgentBackchannelEvent,
     AgentEvent,
     AgentFalseInterruptionEvent,
     AgentStateChangedEvent,
@@ -27,6 +28,7 @@ from .events import (
     ToolCallUpdated,
     ToolExecutionUpdatedEvent,
     ToolReplyUpdated,
+    UserEmotionChangedEvent,
     UserInputTranscribedEvent,
     UserStateChangedEvent,
     UserTranscriptionTimeoutEvent,
@@ -73,6 +75,8 @@ __all__ = [
     "UserTranscriptionTimeoutEvent",
     "AgentStateChangedEvent",
     "FunctionToolsExecutedEvent",
+    "AgentBackchannelEvent",
+    "UserEmotionChangedEvent",
     "AgentFalseInterruptionEvent",
     "RemoteSession",
     "ToolExecutionUpdatedEvent",

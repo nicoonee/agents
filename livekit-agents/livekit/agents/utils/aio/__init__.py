@@ -1,5 +1,5 @@
 from . import debug, duplex_unix, itertools
-from .channel import Chan, ChanClosed, ChanReceiver, ChanSender
+from .channel import Chan, ChanClosed, ChanFull, ChanReceiver, ChanSender
 from .counter import AsyncAtomicCounter
 from .interval import Interval, interval
 from .sleep import Sleep, SleepFinished, sleep
@@ -10,6 +10,7 @@ from .wait_group import WaitGroup
 __all__ = [
     "AsyncAtomicCounter",
     "ChanClosed",
+    "ChanFull",
     "Chan",
     "ChanSender",
     "ChanReceiver",

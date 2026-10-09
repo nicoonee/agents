@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+import time
+from collections.abc import AsyncIterable
+from dataclasses import dataclass, field
 from typing import Literal, Protocol, runtime_checkable
 
 from typing_extensions import TypedDict
@@ -258,27 +260,37 @@ _USER_TURN_LIMIT_DEFAULTS: UserTurnLimitOptions = {
 
 
 class BackchannelOptions(TypedDict, total=False):
-    """Configuration for agent backchannels: short acknowledgements ("mm-hmm",
-    "right") played while the user is still speaking, without taking the turn.
+    """Configuration for the default ``Agent.backchannel_node``: short acknowledgements
+    ("mm-hmm", "right") played while the user is still speaking, without taking the turn.
 
-    Disabled by default. A backchannel plays at a pause the turn detector scores
-    as a backchannel opportunity or, when the turn is owned by a realtime model's
-    server-side detection or by manual control, at a pause reported by the
-    client-side VAD (a ``vad`` instance must be set on the session). The clip is
-    played through the session's audio output as an interruptible speech that is
-    never added to the chat context.
+    Disabled by default. An opportunity arises at a pause the turn detector scores as
+    one or, when the turn is owned by a realtime model's server-side detection or by
+    manual control, at a pause reported by the client-side VAD (a ``vad`` instance must
+    be set on the session). Every opportunity goes through ``Agent.backchannel_node``;
+    these options drive the default implementation only. An agent that overrides the
+    node decides on its own, from a persona or learned user preferences, and ignores
+    the options unless it reads them. The chosen clip is played through the session's
+    audio output as an interruptible speech that is never added to the chat context.
     """
 
     enabled: bool
-    """Whether the agent backchannels. Defaults to ``False``."""
+    """Whether the default node backchannels. Defaults to ``False``."""
     audio: list[str]
     """Audio files to pick from at random, one per backchannel, in any format the
     session's codecs decode. Defaults to ``[]``, which plays nothing."""
     min_interval: float
     """Minimum seconds between two backchannels. Defaults to ``4.0``."""
     min_speech: float
-    """Seconds of user speech since the agent last spoke before the first
+    """Seconds of user speech since the agent last replied before the first
     backchannel. Defaults to ``2.0``."""
+    max_per_turn: int
+    """Backchannels at most since the agent last replied. Defaults to ``3``."""
+    fire_probability: float
+    """Chance to backchannel at an eligible pause, so the rhythm is not mechanical.
+    Defaults to ``0.8``."""
+    volume: float
+    """Gain applied to the clip; a backchannel stays under the speaker's voice.
+    Defaults to ``0.6``."""
     max_end_of_turn_probability: float
     """A turn-detector opportunity whose end-of-turn probability is above this
     value is skipped: a reply is imminent and would collide. Defaults to ``0.5``."""
@@ -289,8 +301,71 @@ _BACKCHANNEL_DEFAULTS: BackchannelOptions = {
     "audio": [],
     "min_interval": 4.0,
     "min_speech": 2.0,
+    "max_per_turn": 3,
+    "fire_probability": 0.8,
+    "volume": 0.6,
     "max_end_of_turn_probability": 0.5,
 }
+
+
+@dataclass
+class UserEmotion:
+    """What an ``Agent.emotion_node`` heard in the user's voice over its latest window.
+
+    The vocabulary of ``label`` is the node's own; the dimensions are optional and
+    ``0..1`` when given. An estimate, not a fact about the user."""
+
+    label: str
+    """The dominant label, in the node's vocabulary ("neutral", "sad", "angry", ...)."""
+    confidence: float
+    """How sure the node is of ``label``, ``0..1``."""
+    scores: dict[str, float] = field(default_factory=dict)
+    """Every label the node scored, when it scores more than one."""
+    arousal: float | None = None
+    """Calm (``0``) to excited (``1``), when the node estimates it."""
+    valence: float | None = None
+    """Negative (``0``) to positive (``1``), when the node estimates it."""
+    window_duration: float = 0.0
+    """Seconds of audio behind this estimate."""
+    created_at: float = field(default_factory=time.time)
+
+
+@dataclass
+class BackchannelOpportunity:
+    """A pause in the user's speech at which the agent may backchannel.
+
+    Passed to ``Agent.backchannel_node``. The counters describe the user's current
+    turn: everything since the agent's last reply ended."""
+
+    source: Literal["vad", "turn_detector"]
+    """What found the pause: the client-side VAD, or the turn detector's prediction."""
+    user_speech_duration: float
+    """Seconds of user speech since the agent's last reply."""
+    count_in_turn: int
+    """Backchannels already played since the agent's last reply."""
+    since_last: float | None
+    """Seconds since the previous backchannel, ``None`` before the first one."""
+    end_of_turn_probability: float | None = None
+    """The turn detector's end-of-turn probability at this pause, when it ran."""
+    backchannel_probability: float | None = None
+    """The turn detector's backchannel probability at this pause, when it ran."""
+    language: str | None = None
+    """The language the turn detector saw, when known."""
+    user_emotion: UserEmotion | None = None
+    """The latest estimate from ``Agent.emotion_node``, when one runs."""
+    created_at: float = field(default_factory=time.time)
+
+
+@dataclass
+class BackchannelResponse:
+    """What ``Agent.backchannel_node`` returns when the agent should backchannel."""
+
+    audio: str | AsyncIterable[rtc.AudioFrame]
+    """A file path the session's codecs decode, or audio frames (pre-synthesized)."""
+    volume: float = 1.0
+    """Gain applied to the audio before playout."""
+    text: str = ""
+    """What the clip says, forwarded to the transcription output; empty for none."""
 
 
 class TurnHandlingOptions(TypedDict, total=False):
@@ -321,7 +396,8 @@ class TurnHandlingOptions(TypedDict, total=False):
     user_turn_limit: UserTurnLimitOptions
     """User turn limit configuration. Use ``{"max_words": 50}`` to enable."""
     backchannel: BackchannelOptions
-    """Agent backchannel configuration. Use ``{"enabled": True, "audio": [...]}`` to enable."""
+    """Options of the default ``Agent.backchannel_node``. Use
+    ``{"enabled": True, "audio": [...]}`` to enable it."""
 
 
 def _resolve_preemptive_generation(
